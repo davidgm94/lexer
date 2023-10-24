@@ -3,6 +3,20 @@ const assert = std.debug.assert;
 const Instant = std.time.Instant;
 const print = std.debug.print;
 
+const page_size = std.mem.page_size;
+
+comptime {
+    if (@import("builtin").cpu.arch != .x86_64) {
+        @compileError("Only x86_64 is supported");
+    }
+
+    if (!std.Target.x86.featureSetHas(@import("builtin").cpu.features, std.Target.x86.Feature.avx2)) {
+        @compileError("AVX2 is required");
+    }
+
+    assert(page_size == 0x1000);
+}
+
 const simd = false;
 
 pub fn main() !void {
@@ -17,18 +31,22 @@ pub fn main() !void {
         return error.InvalidInput;
     }
 
+    print("Running in {s} optimization mode\n", .{@tagName(@import("builtin").mode)});
+
     print("Byte count: 0x{x} ", .{buffer_len});
     if (buffer_len % (1024 * 1024) == 0) {
         print("({} MiB)\n", .{@divExact(buffer_len, 1024 * 1024)});
     } else if (buffer_len % 1024 == 0) {
-        print("({} MiB)\n", .{@divExact(buffer_len, 1024)});
+        print("({} KiB)\n", .{@divExact(buffer_len, 1024)});
     } else {
         print("\n", .{});
     }
 
     const buffer = try generateRandomData(buffer_len);
     assert(buffer.len == buffer_len);
-    var token_list = try TokenList.initCapacity(std.heap.page_allocator, buffer.len);
+    const token_list_buffer = try mmap(buffer_len, .{});
+    var token_list_fba = std.heap.FixedBufferAllocator.init(token_list_buffer);
+    var token_list = try TokenList.initCapacity(token_list_fba.allocator(), @divExact(buffer_len, @sizeOf(Token)));
 
     const time_result = switch (simd) {
         true => lexSimd(buffer, &token_list),
@@ -36,9 +54,9 @@ pub fn main() !void {
     };
     switch (Timer.type) {
         .system_precision => {
-            // const mib_s = @as(f64, @floatFromInt(buffer.len * 1024 * 1024)) / @as(f64, @floatFromInt(time_result) / ;
             const mib_s = @as(f64, @floatFromInt(buffer.len * 1000 * 1000 * 1000)) / @as(f64, @floatFromInt(time_result * 1024 * 1024));
-            print("Time: {} ns ({d:0.2} MiB/s)\n", .{ time_result, mib_s });
+            const ns_per_token = @as(f64, @floatFromInt(time_result)) / @as(f64, @floatFromInt(token_list.items.len));
+            print("{} tokens, {} ns ({d:0.2} MiB/s, {d:0.2} ns/token)\n", .{ token_list.items.len, time_result, mib_s, ns_per_token });
         },
         .tsc => print("TSC cycles: {}\n", .{time_result}),
     }
@@ -48,9 +66,6 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
     const timer = Timer.start();
     var i: u32 = 0;
 
-    // while (i < bytes.len) : (i += 1) {
-    //     if (bytes[i] == 0) break;
-    // }
     while (i < bytes.len) {
         const start_i = i;
         const token_id: Token.Id = switch (bytes[start_i]) {
@@ -73,6 +88,7 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
                         break;
                     }
                 } else {
+                    // TODO
                     unreachable;
                 }
 
@@ -97,6 +113,7 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
                         break;
                     }
                 } else {
+                    // TODO
                     unreachable;
                 }
 
@@ -110,13 +127,13 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
             operator_ranges[5].start...operator_ranges[5].end,
             => blk: {
                 const ch = bytes[i];
-                const enum_value: Token.Id = @enumFromInt(ch);
+                const operator: Token.Id = @enumFromInt(ch);
                 i += 1;
-                break :blk enum_value;
+                break :blk operator;
             },
             '\'' => blk: {
                 i += 1;
-                i += @intFromBool(bytes[i] == '\'');
+                i += @intFromBool(bytes[i] == '\\');
                 i += 1;
                 if (bytes[i] != '\'') {
                     reportError(i, bytes[i]);
@@ -135,6 +152,7 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
 
                     i += 1;
                 } else {
+                    // TODO
                     unreachable;
                 }
 
@@ -157,6 +175,7 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
     return timer.end();
 }
 
+// TODO
 fn lexSimd(bytes: Slice, list: *TokenList) u64 {
     _ = list;
     _ = bytes;
@@ -179,7 +198,9 @@ const Timer = struct {
     const @"type" = Type.system_precision;
 
     const Type = enum {
+        // clock_gettime, QueryPerformanceCounter
         system_precision,
+        // ordered tsc
         tsc,
     };
 
@@ -191,7 +212,6 @@ const Timer = struct {
             },
         };
     }
-
     inline fn end(timer: Timer) u64 {
         return switch (Timer.type) {
             .system_precision => Instant.since(Instant.now() catch unreachable, timer.start),
@@ -239,12 +259,12 @@ const Token = packed struct(u64) {
         f64 = 0x1f,
 
         bang = '!', // 0x21
-        double_quote = '\"', // 0x22
+        //double_quote = '\"', // 0x22
         hash = '#', // 0x23
         dollar_sign = '$', // 0x24
         modulus = '%', // 0x25
         ampersand = '&', // 0x26
-        quote = '\'', // 0x27
+        //quote = '\'', // 0x27
         left_parenthesis = '(', // 0x28
         right_parenthesis = ')', // 0x29
         asterisk = '*', // 0x2a
@@ -277,7 +297,7 @@ const Token = packed struct(u64) {
     };
 };
 
-const TokenList = std.ArrayListAligned(Token, 0x1000);
+const TokenList = std.ArrayListAligned(Token, page_size);
 
 pub const FixedKeyword = enum {
     @"comptime",
@@ -353,6 +373,36 @@ const operator_ranges = [_]AsciiRange{
     .{ .start = 0x7b, .end = 0x7e },
 };
 
+pub fn mmap(size: usize, flags: packed struct {
+    executable: bool = false,
+}) ![]align(page_size) u8 {
+    return switch (@import("builtin").os.tag) {
+        .windows => blk: {
+            const windows = std.os.windows;
+            break :blk @as([*]align(page_size) u8, @ptrCast(@alignCast(try windows.VirtualAlloc(null, size, windows.MEM_COMMIT | windows.MEM_RESERVE, windows.PAGE_EXECUTE_READWRITE))))[0..size];
+        },
+        .linux, .macos => |os_tag| blk: {
+            const jit = switch (os_tag) {
+                .macos => 0x800,
+                .linux => 0,
+                else => unreachable,
+            };
+            const execute_flag: switch (os_tag) {
+                .linux => u32,
+                .macos => c_int,
+                else => unreachable,
+            } = if (flags.executable) std.os.PROT.EXEC else 0;
+            const protection_flags: u32 = @intCast(std.os.PROT.READ | std.os.PROT.WRITE | execute_flag);
+            const mmap_flags = std.os.MAP.ANONYMOUS | std.os.MAP.PRIVATE | jit;
+
+            const result = try std.os.mmap(null, size, protection_flags, mmap_flags, -1, 0);
+
+            break :blk result;
+        },
+        else => @compileError("OS not supported"),
+    };
+}
+
 inline fn tscInstant() u64 {
     var eax: u32 = undefined;
     var edx: u32 = undefined;
@@ -377,7 +427,7 @@ const writers = [_]Writer{
     writeRandomStringLiteral,
     writeRandomCharacterLiteral,
 };
-const Slice = []align(0x1000) u8;
+const Slice = []align(page_size) u8;
 
 const Stream = std.io.FixedBufferStream(Slice);
 const Writer = *const fn (stream: Stream.Writer) void;
@@ -461,21 +511,26 @@ fn writeRandomStringLiteral(writer: Stream.Writer) void {
 fn writeRandomCharacterLiteral(writer: Stream.Writer) void {
     writer.writeByte('\'') catch unreachable;
 
-    const ranges = [_]AsciiRange{
-        decimal_range,
-        alphabet_ranges[0],
-        alphabet_ranges[1],
-        operator_ranges[0],
-        operator_ranges[1],
-        operator_ranges[2],
-        operator_ranges[3],
-        operator_ranges[4],
-        operator_ranges[5],
-    };
+    while (true) {
+        const ranges = [_]AsciiRange{
+            decimal_range,
+            alphabet_ranges[0],
+            alphabet_ranges[1],
+            operator_ranges[0],
+            operator_ranges[1],
+            operator_ranges[2],
+            operator_ranges[3],
+            operator_ranges[4],
+            operator_ranges[5],
+        };
 
-    const choice = random.uintLessThan(u8, ranges.len);
-    const character = ranges[choice].getRandomCharacter();
-    writer.writeByte(character) catch unreachable;
+        const choice = random.uintLessThan(u8, ranges.len);
+        const character = ranges[choice].getRandomCharacter();
+        if (character != '\'' and character != '\\') {
+            writer.writeByte(character) catch unreachable;
+            break;
+        }
+    }
 
     writer.writeByte('\'') catch unreachable;
 }
@@ -490,8 +545,8 @@ fn generateRandomData(size: usize) !Slice {
         break :blk seed;
     });
     random = prng.random();
-    assert(std.mem.isAligned(size, 0x1000));
-    const byte_buffer = try std.os.mmap(null, size, std.os.PROT.READ | std.os.PROT.WRITE, std.os.MAP.ANONYMOUS | std.os.MAP.PRIVATE, -1, 0);
+    assert(std.mem.isAligned(size, page_size));
+    const byte_buffer = try mmap(size, .{});
     var stream = Stream{
         .buffer = byte_buffer,
         .pos = 0,
@@ -533,7 +588,7 @@ fn generateRandomData(size: usize) !Slice {
         count += line_character_count;
     }
 
-    // Finish with a string literal
+    // Finish the buffer with a string literal
     const len = byte_buffer.len - count - 2;
 
     writer.writeByte('"') catch unreachable;
