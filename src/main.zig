@@ -31,16 +31,14 @@ pub fn main() !void {
         return error.InvalidInput;
     }
 
-    print("Running in {s} optimization mode\n", .{@tagName(@import("builtin").mode)});
-
-    print("Byte count: 0x{x} ", .{buffer_len});
+    print("Running in {s} optimization mode. Preparing 0x{x} bytes ", .{ @tagName(@import("builtin").mode), buffer_len });
     if (buffer_len % (1024 * 1024) == 0) {
-        print("({} MiB)\n", .{@divExact(buffer_len, 1024 * 1024)});
+        print("({} MiB)", .{@divExact(buffer_len, 1024 * 1024)});
     } else if (buffer_len % 1024 == 0) {
-        print("({} KiB)\n", .{@divExact(buffer_len, 1024)});
-    } else {
-        print("\n", .{});
+        print("({} KiB)", .{@divExact(buffer_len, 1024)});
     }
+
+    print(" worth of data\n", .{});
 
     const buffer = try generateRandomData(buffer_len);
     assert(buffer.len == buffer_len);
@@ -48,6 +46,7 @@ pub fn main() !void {
     var token_list_fba = std.heap.FixedBufferAllocator.init(token_list_buffer);
     var token_list = try TokenList.initCapacity(token_list_fba.allocator(), @divExact(buffer_len, @sizeOf(Token)));
 
+    print("Data prepared. Running benchmark...\n", .{});
     const time_result = switch (simd) {
         true => lexSimd(buffer, &token_list),
         false => lexScalar(buffer, &token_list),
