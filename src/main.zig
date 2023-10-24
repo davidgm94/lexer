@@ -208,14 +208,38 @@ const Timer = struct {
         return Timer{
             .start = switch (Timer.type) {
                 .system_precision => Instant.now() catch unreachable,
-                .tsc => tscInstant(),
+                .tsc => blk: {
+                    var eax: u32 = undefined;
+                    var edx: u32 = undefined;
+
+                    asm volatile (
+                        \\lfence
+                        \\rdtsc
+                        : [eax] "={eax}" (eax),
+                          [edx] "={edx}" (edx),
+                    );
+
+                    break :blk @as(u64, edx) << 32 | eax;
+                },
             },
         };
     }
     inline fn end(timer: Timer) u64 {
         return switch (Timer.type) {
             .system_precision => Instant.since(Instant.now() catch unreachable, timer.start),
-            .tsc => tscInstant() - timer.start,
+            .tsc => (blk: {
+                var eax: u32 = undefined;
+                var edx: u32 = undefined;
+
+                asm volatile (
+                    \\rdtscp
+                    \\lfence
+                    : [eax] "={eax}" (eax),
+                      [edx] "={edx}" (edx),
+                );
+
+                break :blk @as(u64, edx) << 32 | eax;
+            }) - timer.start,
         };
     }
 };
@@ -401,22 +425,6 @@ pub fn mmap(size: usize, flags: packed struct {
         },
         else => @compileError("OS not supported"),
     };
-}
-
-inline fn tscInstant() u64 {
-    var eax: u32 = undefined;
-    var edx: u32 = undefined;
-
-    asm volatile (
-        \\lfence
-        \\rdtsc
-        : [eax] "={eax}" (eax),
-          [edx] "={edx}" (edx),
-        :
-        : "memory"
-    );
-
-    return @as(u64, edx) << 32 | eax;
 }
 
 const writers = [_]Writer{
