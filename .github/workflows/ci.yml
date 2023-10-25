@@ -1,5 +1,11 @@
 name: CI
-on: [push]
+permissions: write-all
+on: 
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
 jobs:
   build_memory:
     runs-on: ubuntu-latest
@@ -7,30 +13,27 @@ jobs:
       - name: Set up Git repository
         uses: actions/checkout@v3
       - name: Compile LaTeX document
-        uses: xu-cheng/latex-action@v3
-        with:
-          root_file: memory/memory.tex
+        run: |
+          sudo apt update
+          sudo apt install texlive-full
+          mkdir public
+          cp memory/*.tex public
+          cd public
+          pdflatex memory.tex
+
       - name: Upload PDF file
+        if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v3
         with:
-          name: PDF
-          path: memory.pdf
-
-      - name: Tag the repository
+          name: memory.pdf
+          path: public/memory.pdf
+      - name: Create release tag
         id: tag
-        if: github.ref == 'refs/heads/main'
         run: |
-          TAG=v$(date -Iseconds | sed 's/[T:\+]/-/g')
-          echo "$TAG"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          git config user.name "GitHub Action"
-          git config user.email "actions@github.com"
-          git tag -a $TAG -m "Published version $TAG" ${GITHUB_SHA}
-          git push origin $TAG
-
+          echo "::set-output name=release_tag::UserBuild_$(date +"%Y.%m.%d_%H-%M")"
       - name: Release
         uses: softprops/action-gh-release@v1
         if: github.ref == 'refs/heads/main'
         with:
-          files: memory.pdf
-          tag_name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          files: public/memory.pdf
