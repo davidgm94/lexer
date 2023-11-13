@@ -17,21 +17,47 @@ comptime {
     assert(page_size == 0x1000);
 }
 
-const simd = false;
-
 pub fn main() !void {
-    const arguments = try std.process.argsAlloc(std.heap.c_allocator);
-    if (arguments.len != 2) return error.InvalidInput;
-    const buffer_len = if (std.mem.eql(u8, arguments[1][0..2], "0x"))
-        try std.fmt.parseInt(u64, arguments[1][2..], 16)
-    else
-        try std.fmt.parseInt(u64, arguments[1], 10);
+    const arguments = try std.process.argsAlloc(std.heap.page_allocator);
 
-    if (!std.mem.isAligned(buffer_len, std.mem.page_size)) {
-        return error.InvalidInput;
+    var arg_simd: ?bool = null;
+    var arg_page_size: ?usize = null;
+    var argument_i: usize = 1;
+
+    while (argument_i < arguments.len) : (argument_i += 1) {
+        const argument = arguments[argument_i];
+        const index = argument_i + 1;
+        if (std.mem.eql(u8, argument, "-size")) {
+            if (index < arguments.len) {
+                arg_page_size = if (std.mem.eql(u8, arguments[index][0..2], "0x"))
+                    try std.fmt.parseInt(u64, arguments[index][2..], 16)
+                else
+                    try std.fmt.parseInt(u64, arguments[index], 10);
+
+                if (!std.mem.isAligned(arg_page_size.?, std.mem.page_size)) {
+                    return error.InvalidInput;
+                }
+
+                argument_i += 1;
+            } else return error.InvalidInput;
+        } else if (std.mem.eql(u8, argument, "-simd")) {
+            if (index < arguments.len) {
+                const bool_arg = arguments[index];
+                if (std.mem.eql(u8, bool_arg, "true")) {
+                    arg_simd = true;
+                } else if (std.mem.eql(u8, bool_arg, "false")) {
+                    arg_simd = false;
+                } else return error.InvalidInput;
+
+                argument_i += 1;
+            } else return error.InvalidInput;
+        } else return error.InvalidInput;
     }
 
-    print("Running in {s} optimization mode. Preparing 0x{x} bytes ", .{ @tagName(@import("builtin").mode), buffer_len });
+    const simd = arg_simd orelse true;
+    const buffer_len = arg_page_size orelse 0x1000000;
+
+    print("Running in {s} optimization mode. SIMD on: {}. Preparing 0x{x} bytes ", .{ @tagName(@import("builtin").mode), simd, buffer_len });
     if (buffer_len % (1024 * 1024) == 0) {
         print("({} MiB)", .{@divExact(buffer_len, 1024 * 1024)});
     } else if (buffer_len % 1024 == 0) {
@@ -54,8 +80,13 @@ pub fn main() !void {
     switch (Timer.type) {
         .system_precision => {
             const mib_s = @as(f64, @floatFromInt(buffer.len * 1000 * 1000 * 1000)) / @as(f64, @floatFromInt(time_result * 1024 * 1024));
-            const ns_per_token = @as(f64, @floatFromInt(time_result)) / @as(f64, @floatFromInt(token_list.items.len));
-            print("{} tokens, {} ns ({d:0.2} MiB/s, {d:0.2} ns/token)\n", .{ token_list.items.len, time_result, mib_s, ns_per_token });
+            print("{} ns. {d:0.2} MiB/s\n", .{ time_result, mib_s });
+            if (token_list.items.len > 0) {
+                const ns_per_token = @as(f64, @floatFromInt(time_result)) / @as(f64, @floatFromInt(token_list.items.len));
+                print("{} tokens ({d:0.2} ns/token)\n", .{ token_list.items.len, ns_per_token });
+            } else {
+                print("No token was processed\n", .{});
+            }
         },
         .tsc => print("TSC cycles: {}\n", .{time_result}),
     }
@@ -89,14 +120,6 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
                 } else {
                     // TODO
                     unreachable;
-                }
-
-                const string = bytes[start_i..][0 .. i - start_i];
-                inline for (@typeInfo(FixedKeyword).Enum.fields) |enum_field| {
-                    const enum_value = @field(FixedKeyword, enum_field.name);
-                    if (std.mem.eql(u8, string, @tagName(enum_value))) {
-                        break :blk @enumFromInt(@intFromEnum(enum_value));
-                    }
                 }
 
                 break :blk .identifier;
@@ -162,6 +185,7 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
             },
             else => |ch| reportError(i, ch),
         };
+
         const len = i - start_i;
         const token = Token{
             .id = token_id,
@@ -174,13 +198,90 @@ fn lexScalar(bytes: Slice, list: *TokenList) u64 {
     return timer.end();
 }
 
+const Chunk = @Vector(chunk_byte_count, u8);
+const Bitmask = u64;
+const ChunkBitset = @Vector(64, u1);
+const chunk_byte_count = 64;
+
+fn fillMask(ch: u8) Chunk {
+    return @splat(ch);
+}
+
+fn characterBitset(chunk: Chunk, ch: u8) ChunkBitset {
+    const mask: Chunk = @splat(ch);
+    return @bitCast(mask == chunk);
+}
+
+fn getChunkFromSlice(slice: []const u8, index: usize) Chunk {
+    const chunk: Chunk = @bitCast(slice[index..][0..chunk_byte_count].*);
+    return chunk;
+}
+
+fn isInsideRange(chunk: Chunk, range: AsciiRange) ChunkBitset {
+    const is_greater_or_eq_than_start_ch: ChunkBitset = @bitCast(chunk >= fillMask(range.start));
+    const is_lower_or_eq_than_end_ch: ChunkBitset = @bitCast(chunk <= fillMask(range.end));
+    return is_greater_or_eq_than_start_ch & is_lower_or_eq_than_end_ch;
+}
+
+fn isInsideRanges(chunk: Chunk, comptime ranges: []const AsciiRange) ChunkBitset {
+    var bitset: ChunkBitset = [1]u8{0} ** 64;
+    inline for (ranges) |range| {
+        const is_inside_range = isInsideRange(chunk, range);
+        bitset |= is_inside_range;
+    }
+
+    return bitset;
+}
+
 // TODO
 fn lexSimd(bytes: Slice, list: *TokenList) u64 {
     _ = list;
-    _ = bytes;
 
     const timer = Timer.start();
-    return timer.end();
+
+    var character_i: usize = 0;
+    while (character_i + chunk_byte_count < bytes.len) {
+        const chunk = getChunkFromSlice(bytes, character_i);
+        const space_bitset = characterBitset(chunk, '\n') | characterBitset(chunk, '\r') | characterBitset(chunk, '\t') | characterBitset(chunk, ' ');
+        const space_character_count = @ctz(~@as(u64, @bitCast(space_bitset)));
+        character_i += space_character_count;
+
+        const is_alphabet_bitset = isInsideRanges(chunk, &alphabet_ranges);
+        const is_decimal_bitset = isInsideRange(chunk, decimal_range);
+        const is_underscore_bitset = characterBitset(chunk, '_');
+        const identifier_bitset = is_alphabet_bitset | is_decimal_bitset | is_underscore_bitset;
+        const is_identifier_mask: ChunkBitset = @splat(is_alphabet_bitset[0]);
+        const identifier_character_count = @ctz(~(@as(u64, @bitCast(identifier_bitset)))) & @as(u64, @bitCast(is_identifier_mask));
+        character_i += identifier_character_count;
+
+        const is_hex_prefix_chunk: Chunk = [2]u8{ '0', 'x' } ** (chunk_byte_count / 2);
+        const is_bin_prefix_chunk: Chunk = [2]u8{ '0', 'b' } ** (chunk_byte_count / 2);
+        const is_octal_prefix_chunk: Chunk = [2]u8{ '0', 'o' } ** (chunk_byte_count / 2);
+
+        const is_hex_prefix: ChunkBitset = @bitCast(chunk == is_hex_prefix_chunk);
+        const is_bin_prefix: ChunkBitset = @bitCast(chunk == is_bin_prefix_chunk);
+        const is_octal_prefix: ChunkBitset = @bitCast(chunk == is_octal_prefix_chunk);
+        const is_number_prefix = is_hex_prefix | is_bin_prefix | is_octal_prefix;
+        const prefix_character_count = 2 & @as(u64, @bitCast(@as(ChunkBitset, @splat(is_number_prefix[1] & is_number_prefix[0]))));
+        character_i += prefix_character_count;
+
+        const is_extra_hex_character = isInsideRanges(chunk, &extra_hex_ranges);
+        const is_number_bitset = is_extra_hex_character | is_decimal_bitset;
+        const number_literal_character_count = ~@ctz(@as(u64, @bitCast(is_number_bitset)));
+        character_i += number_literal_character_count;
+
+        // TODO: extra hardening the code
+        // TODO: string literals
+        // TODO: character literals
+        // TODO: operators
+        // TODO: store tokens
+    }
+
+    // TODO: loop end
+
+    const time_result = timer.end();
+
+    return time_result;
 }
 
 fn reportError(index: usize, character: u8) noreturn {
@@ -248,38 +349,10 @@ const Token = packed struct(u64) {
     len: u24,
     id: Id,
     const Id = enum(u8) {
-        fixed_keyword_function = 0x00,
-        fixed_keyword_const = 0x01,
-        fixed_keyword_var = 0x02,
-        fixed_keyword_void = 0x03,
-        fixed_keyword_noreturn = 0x04,
-        fixed_keyword_comptime = 0x05,
-        fixed_keyword_while = 0x06,
-        fixed_keyword_bool = 0x07,
-        fixed_keyword_true = 0x08,
-        fixed_keyword_false = 0x09,
-        fixed_keyword_fn = 0x0a,
-        fixed_keyword_unreachable = 0x0b,
-        fixed_keyword_return = 0x0c,
-        fixed_keyword_ssize = 0x0d,
-        fixed_keyword_usize = 0x0e,
-        fixed_keyword_switch = 0x0f,
-        fixed_keyword_if = 0x10,
-        fixed_keyword_else = 0x11,
-        fixed_keyword_struct = 0x12,
-        fixed_keyword_enum = 0x13,
-        fixed_keyword_union = 0x14,
-        fixed_keyword_extern = 0x15,
-        u8 = 0x16,
-        u16 = 0x17,
-        u32 = 0x18,
-        u64 = 0x19,
-        s8 = 0x1a,
-        s16 = 0x1b,
-        s32 = 0x1c,
-        s64 = 0x1d,
-        f32 = 0x1e,
-        f64 = 0x1f,
+        identifier = 0x00,
+        number = 0x01,
+        character_literal = 0x02,
+        string_literal = 0x03,
 
         bang = '!', // 0x21
         //double_quote = '\"', // 0x22
@@ -313,49 +386,10 @@ const Token = packed struct(u64) {
         vertical_bar = '|', // 0x7c
         right_brace = '}', // 0x7d
         tilde = '~', // 0x7e
-        identifier = 0x7f,
-        number = 0x80,
-        character_literal = 0x81,
-        string_literal = 0x82,
     };
 };
 
 const TokenList = std.ArrayListAligned(Token, page_size);
-
-pub const FixedKeyword = enum {
-    @"comptime",
-    @"const",
-    @"var",
-    void,
-    noreturn,
-    function,
-    @"while",
-    bool,
-    true,
-    false,
-    @"fn",
-    @"unreachable",
-    @"return",
-    ssize,
-    usize,
-    @"switch",
-    @"if",
-    @"else",
-    @"struct",
-    @"enum",
-    @"union",
-    @"extern",
-    u8,
-    u16,
-    u32,
-    u64,
-    s8,
-    s16,
-    s32,
-    s64,
-    f32,
-    f64,
-};
 
 const AsciiRange = struct {
     start: u8,
@@ -430,7 +464,6 @@ const writers = [_]Writer{
     writeRandomOperator,
     writeRandomInt,
     writeRandomIdentifier,
-    writeRandomKeyword,
     writeRandomStringLiteral,
     writeRandomCharacterLiteral,
 };
@@ -481,12 +514,6 @@ fn writeRandomIdentifier(writer: Stream.Writer) void {
         const random_character = range.getRandomCharacter();
         writer.writeByte(random_character) catch unreachable;
     }
-}
-
-fn writeRandomKeyword(writer: Stream.Writer) void {
-    const choice = random.uintLessThan(u8, @typeInfo(FixedKeyword).Enum.fields.len);
-    const enum_tag = @tagName(@as(FixedKeyword, @enumFromInt(choice)));
-    _ = writer.write(enum_tag) catch unreachable;
 }
 
 fn writeRandomStringLiteral(writer: Stream.Writer) void {
