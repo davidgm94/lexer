@@ -23,6 +23,7 @@ pub fn main() !void {
     var arg_simd: ?bool = null;
     var arg_page_size: ?usize = null;
     var argument_i: usize = 1;
+    var arg_lex_self: ?bool = null;
 
     while (argument_i < arguments.len) : (argument_i += 1) {
         const argument = arguments[argument_i];
@@ -51,35 +52,60 @@ pub fn main() !void {
 
                 argument_i += 1;
             } else return error.InvalidInput;
+        } else if (std.mem.eql(u8, argument, "-lex-self")) {
+            if (index < arguments.len) {
+                const bool_arg = arguments[index];
+                if (std.mem.eql(u8, bool_arg, "true")) {
+                    arg_lex_self = true;
+                } else if (std.mem.eql(u8, bool_arg, "false")) {
+                    arg_lex_self = false;
+                } else return error.InvalidInput;
+
+                argument_i += 1;
+            } else return error.InvalidInput;
         } else return error.InvalidInput;
     }
 
     const simd = arg_simd orelse true;
-    const buffer_len = arg_page_size orelse 0x1000000;
+    const lex_self = arg_lex_self orelse false;
 
-    print("Running in {s} optimization mode. SIMD on: {}. Preparing 0x{x} bytes ", .{ @tagName(@import("builtin").mode), simd, buffer_len });
-    if (buffer_len % (1024 * 1024) == 0) {
-        print("({} MiB)", .{@divExact(buffer_len, 1024 * 1024)});
-    } else if (buffer_len % 1024 == 0) {
-        print("({} KiB)", .{@divExact(buffer_len, 1024)});
-    }
+    print("Running in {s} optimization mode. SIMD on: {}.\n", .{ @tagName(@import("builtin").mode), simd });
+    const lexer_input_data = if (lex_self) blk: {
+        print("Lexing this program source file...\n", .{});
+        const file = try std.fs.cwd().openFile("src/main.zig", .{});
+        const file_size = try file.getEndPos();
+        const aligned_file_size = std.mem.alignForward(usize, file_size, page_size);
+        const file_buffer = try mmap(aligned_file_size, .{});
+        _ = try file.readAll(file_buffer);
+        break :blk file_buffer;
+    } else blk: {
+        const buffer_len = arg_page_size orelse 0x1000000;
+        print("Preparing 0x{x} bytes ", .{buffer_len});
+        if (buffer_len % (1024 * 1024) == 0) {
+            print("({} MiB)", .{@divExact(buffer_len, 1024 * 1024)});
+        } else if (buffer_len % 1024 == 0) {
+            print("({} KiB)", .{@divExact(buffer_len, 1024)});
+        }
 
-    print(" worth of data\n", .{});
+        print(" worth of data\n", .{});
 
-    const buffer = try generateRandomData(buffer_len);
-    assert(buffer.len == buffer_len);
-    const token_list_buffer = try mmap(buffer_len, .{});
+        const buffer = try generateRandomData(buffer_len);
+        assert(buffer.len == buffer_len);
+
+        print("Data prepared. Running benchmark...\n", .{});
+
+        break :blk buffer;
+    };
+    const token_list_buffer = try mmap(lexer_input_data.len, .{});
     var token_list_fba = std.heap.FixedBufferAllocator.init(token_list_buffer);
-    var token_list = try TokenList.initCapacity(token_list_fba.allocator(), @divExact(buffer_len, @sizeOf(Token)));
-
-    print("Data prepared. Running benchmark...\n", .{});
+    var token_list = try TokenList.initCapacity(token_list_fba.allocator(), @divExact(lexer_input_data.len, @sizeOf(Token)));
     const time_result = switch (simd) {
-        true => lexSimd(buffer, &token_list),
-        false => lexScalar(buffer, &token_list),
+        true => lexSimd(lexer_input_data, &token_list),
+        false => lexScalar(lexer_input_data, &token_list),
     };
     switch (Timer.type) {
         .system_precision => {
-            const mib_s = @as(f64, @floatFromInt(buffer.len * 1000 * 1000 * 1000)) / @as(f64, @floatFromInt(time_result * 1024 * 1024));
+            const mib_s = @as(f64, @floatFromInt(lexer_input_data.len * 1000 * 1000 * 1000)) / @as(f64, @floatFromInt(time_result * 1024 * 1024));
             print("{} ns. {d:0.2} MiB/s\n", .{ time_result, mib_s });
             if (token_list.items.len > 0) {
                 const ns_per_token = @as(f64, @floatFromInt(time_result)) / @as(f64, @floatFromInt(token_list.items.len));
@@ -233,6 +259,22 @@ fn isInsideRanges(chunk: Chunk, comptime ranges: []const AsciiRange) ChunkBitset
     return bitset;
 }
 
+fn endOfChunkBranchless(offset: usize) usize {
+    return offset & 64 >> 6;
+}
+
+fn isEndOfChunkMask(offset: usize) usize {
+    return u1Mask(endOfChunkBranchless(offset));
+}
+
+fn u1Mask(v: u64) u64 {
+    return ~(v -% 1);
+}
+
+fn b64Mask(b: bool) u64 {
+    return u1Mask(@intFromBool(b));
+}
+
 // TODO
 fn lexSimd(bytes: Slice, list: *TokenList) u64 {
     _ = list;
@@ -240,41 +282,85 @@ fn lexSimd(bytes: Slice, list: *TokenList) u64 {
     const timer = Timer.start();
 
     var character_i: usize = 0;
-    while (character_i + chunk_byte_count < bytes.len) {
-        const chunk = getChunkFromSlice(bytes, character_i);
-        const space_bitset = characterBitset(chunk, '\n') | characterBitset(chunk, '\r') | characterBitset(chunk, '\t') | characterBitset(chunk, ' ');
-        const space_character_count = @ctz(~@as(u64, @bitCast(space_bitset)));
-        character_i += space_character_count;
+    var identifier_carry_mask: u64 = 0;
+    var number_carry_mask: u64 = 0;
+    var character_literal_carry_mask: u64 = 0;
+    var string_literal_carry_mask: u64 = 0;
 
+    while (character_i + chunk_byte_count < bytes.len) {
+        var iteration_offset: usize = 0;
+
+        const chunk = getChunkFromSlice(bytes, character_i);
+        // print("chunk:\n```\n{s}\n```\n", .{@as([64]u8, @bitCast(chunk))});
+
+        const space_bitset = characterBitset(chunk, '\n') | characterBitset(chunk, '\r') | characterBitset(chunk, '\t') | characterBitset(chunk, ' ');
         const is_alphabet_bitset = isInsideRanges(chunk, &alphabet_ranges);
         const is_decimal_bitset = isInsideRange(chunk, decimal_range);
         const is_underscore_bitset = characterBitset(chunk, '_');
         const identifier_bitset = is_alphabet_bitset | is_decimal_bitset | is_underscore_bitset;
-        const is_identifier_mask: ChunkBitset = @splat(is_alphabet_bitset[0]);
-        const identifier_character_count = @ctz(~(@as(u64, @bitCast(identifier_bitset)))) & @as(u64, @bitCast(is_identifier_mask));
-        character_i += identifier_character_count;
+        const is_double_quote = characterBitset(chunk, '"');
+        const is_single_quote = characterBitset(chunk, '\'');
+        const is_escape_character = characterBitset(chunk, '\\');
+        _ = is_escape_character;
+        const is_operator_bitset = isInsideRanges(chunk, &operator_ranges);
 
-        const is_hex_prefix_chunk: Chunk = [2]u8{ '0', 'x' } ** (chunk_byte_count / 2);
-        const is_bin_prefix_chunk: Chunk = [2]u8{ '0', 'b' } ** (chunk_byte_count / 2);
-        const is_octal_prefix_chunk: Chunk = [2]u8{ '0', 'o' } ** (chunk_byte_count / 2);
+        const space_mask = ~string_literal_carry_mask | ~character_literal_carry_mask;
 
-        const is_hex_prefix: ChunkBitset = @bitCast(chunk == is_hex_prefix_chunk);
-        const is_bin_prefix: ChunkBitset = @bitCast(chunk == is_bin_prefix_chunk);
-        const is_octal_prefix: ChunkBitset = @bitCast(chunk == is_octal_prefix_chunk);
-        const is_number_prefix = is_hex_prefix | is_bin_prefix | is_octal_prefix;
-        const prefix_character_count = 2 & @as(u64, @bitCast(@as(ChunkBitset, @splat(is_number_prefix[1] & is_number_prefix[0]))));
-        character_i += prefix_character_count;
+        const space_character_count = @ctz(~@as(u64, @bitCast(space_bitset))) & space_mask;
+        // print("space character count: {}\n", .{space_character_count});
+        iteration_offset += space_character_count;
+        const space_clobber_mask = b64Mask(space_character_count > 0);
+        identifier_carry_mask &= space_clobber_mask;
+        number_carry_mask &= space_clobber_mask;
+        assert(iteration_offset <= 64);
 
-        const is_extra_hex_character = isInsideRanges(chunk, &extra_hex_ranges);
-        const is_number_bitset = is_extra_hex_character | is_decimal_bitset;
-        const number_literal_character_count = ~@ctz(@as(u64, @bitCast(is_number_bitset)));
-        character_i += number_literal_character_count;
+        // print("identifier bitset: {}", .{identifier_bitset});
+        const is_identifier_mask = u1Mask(is_alphabet_bitset[iteration_offset]);
+        const identifier_bitset_mask = std.math.shr(u64, @as(u64, @bitCast(identifier_bitset)), iteration_offset);
+        // print("iteration offset: {}. Is identifier mask: 0x{x}. Identifier bitset mask: 0b{b}\n", .{ iteration_offset, is_identifier_mask, identifier_bitset_mask });
+        // print("string literal mask: {x}. char literal mask: {x}\n", .{ string_literal_carry_mask, character_literal_carry_mask });
+        const identifier_character_count = @ctz(~identifier_bitset_mask) & (is_identifier_mask | (identifier_carry_mask | (~string_literal_carry_mask | ~character_literal_carry_mask)));
+        // print("Identifier character count: {}\n", .{identifier_character_count});
+        iteration_offset += identifier_character_count;
+        assert(iteration_offset <= 64);
+        identifier_carry_mask = isEndOfChunkMask(iteration_offset & b64Mask(identifier_character_count != 0));
+
+        const number_literal_character_count = @ctz(~std.math.shr(u64, @as(u64, @bitCast(is_decimal_bitset)), iteration_offset));
+        // print("number ch: {}\n", .{number_literal_character_count});
+        iteration_offset += number_literal_character_count;
+        assert(iteration_offset <= 64);
+        number_carry_mask = isEndOfChunkMask(iteration_offset & b64Mask(number_literal_character_count != 0));
+
+        // const is_end_of_chunk_mask: u64 = iteration_offset &
+        const is_string_literal_start_mask = u1Mask(is_double_quote[iteration_offset]);
+        const supposed_string_literal_character_count = @ctz(~std.math.shr(u64, ~@as(u64, @bitCast(is_double_quote)), iteration_offset + 1));
+        const string_literal_character_count = (@as(u64, 1) + @intFromBool(iteration_offset + supposed_string_literal_character_count + 1 != 64) + supposed_string_literal_character_count) & (is_string_literal_start_mask | string_literal_carry_mask);
+        // print("String literal count: {}. Iteration offset: {}\n", .{ string_literal_character_count, iteration_offset });
+        iteration_offset += string_literal_character_count;
+        assert(iteration_offset <= 64);
+        string_literal_carry_mask = u1Mask(endOfChunkBranchless(iteration_offset) & is_double_quote[63] & b64Mask(string_literal_character_count != 0));
+
+        const is_operator_bitset_mask = std.math.shr(u64, @as(u64, @bitCast(is_operator_bitset)), iteration_offset);
+        const operator_character_count = @ctz(~is_operator_bitset_mask);
+        iteration_offset += operator_character_count;
+        assert(iteration_offset <= 64);
+
+        // TODO: compute correctly character literal
+        const character_literal_mask = std.math.shr(u64, ~@as(u64, @bitCast(is_single_quote)), iteration_offset + 1);
+        const is_not_end_of_chunk_mask = ~isEndOfChunkMask(iteration_offset);
+        const is_character_literal_start_mask = u1Mask(is_single_quote[iteration_offset & is_not_end_of_chunk_mask]) & is_not_end_of_chunk_mask;
+        // print("Character literal carry mask: {x}", .{character_literal_carry_mask});
+        const character_literal_character_count = (2 + @ctz(~character_literal_mask)) & is_character_literal_start_mask;
+        iteration_offset += character_literal_character_count;
+        // print("Character literal character count: {}\n", .{character_literal_character_count});
+        assert(iteration_offset <= 64);
+        character_literal_carry_mask = u1Mask(endOfChunkBranchless(iteration_offset) & is_single_quote[63] & b64Mask(character_literal_character_count != 0));
 
         // TODO: extra hardening the code
-        // TODO: string literals
-        // TODO: character literals
-        // TODO: operators
         // TODO: store tokens
+
+        // print("Space character count: {}. Identifier character count: {}. Number literal character count: {}\n", .{ space_character_count, identifier_character_count, number_literal_character_count });
+        character_i += iteration_offset;
     }
 
     // TODO: loop end
@@ -353,39 +439,7 @@ const Token = packed struct(u64) {
         number = 0x01,
         character_literal = 0x02,
         string_literal = 0x03,
-
-        bang = '!', // 0x21
-        //double_quote = '\"', // 0x22
-        hash = '#', // 0x23
-        dollar_sign = '$', // 0x24
-        modulus = '%', // 0x25
-        ampersand = '&', // 0x26
-        //quote = '\'', // 0x27
-        left_parenthesis = '(', // 0x28
-        right_parenthesis = ')', // 0x29
-        asterisk = '*', // 0x2a
-        plus = '+', // 0x2b
-        comma = ',', // 0x2c
-        minus = '-', // 0x2d
-        period = '.', // 0x2e
-        slash = '/', // 0x2f
-        colon = ':', // 0x3a
-        semicolon = ';', // 0x3b
-        less = '<', // 0x3c
-        equal = '=', // 0x3d
-        greater = '>', // 0x3e
-        question_mark = '?', // 0x3f
-        at = '@', // 0x40
-        left_bracket = '[', // 0x5b
-        backslash = '\\', // 0x5c
-        right_bracket = ']', // 0x5d
-        caret = '^', // 0x5e
-        underscore = '_', // 0x5f
-        grave = '`', // 0x60
-        left_brace = '{', // 0x7b
-        vertical_bar = '|', // 0x7c
-        right_brace = '}', // 0x7d
-        tilde = '~', // 0x7e
+        operator = 0x04,
     };
 };
 
@@ -479,21 +533,8 @@ fn writeRandomOperator(writer: Stream.Writer) void {
 }
 
 fn writeRandomInt(writer: Stream.Writer) void {
-    const IntFormat = enum {
-        decimal,
-        hexadecimal,
-        binary,
-        octal,
-    };
-
-    const format_choice: IntFormat = @enumFromInt(random.uintLessThan(u8, @typeInfo(IntFormat).Enum.fields.len));
     const integer = random.int(u64);
-    switch (format_choice) {
-        .decimal => writer.print("{}", .{integer}) catch unreachable,
-        .hexadecimal => writer.print("0x{x}", .{integer}) catch unreachable,
-        .binary => writer.print("0b{b}", .{integer}) catch unreachable,
-        .octal => writer.print("0o{o}", .{integer}) catch unreachable,
-    }
+    writer.print("{}", .{integer}) catch unreachable;
 }
 
 fn writeRandomIdentifier(writer: Stream.Writer) void {
