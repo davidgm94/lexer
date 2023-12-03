@@ -9,6 +9,7 @@
 	breaklines=true
 }
 \title{\vspace{-2.5cm}\textbf{Exploiting Modern CPU Architectures for Lexical Analysis}}
+\author{David Gonzalez Martin}
 \date{\vspace{-5ex}}
 
 \begin{document}
@@ -19,19 +20,25 @@
 	\section{Introduction}
 	TODO: does this belong here or in the next subsection?
 	
-	\paragraph{}As a software engineer, it does not take much to discover how fast modern computers are (from CPU internals to disk).
+	\paragraph{}
+	As a software engineer, it does not take much to discover how fast modern computers are (from CPU internals to disk).
 	
-	\paragraph{}Modern server CPUs are a clear example of this. AMD provides bandwidth and frequency information about their professional CPUs in their website. At the moment of writing this, their top CPU for servers was the AMD EPYC 9654\cite{epyc}, launched in November 10, 2022. According to the official data, this is a processor with 96 cores, 192 threads, with a base clock of 2.4 GHz and all-core boost clock of 3.55 GHz; it has a 384 MB L3 Cache and it delivers a per-socket RAM bandwidth of 460.8 GB/s with up to 12 memory channels and 128 PCI-Express 5.0 slots. It is clearly a wonder of modern technology.
+	\paragraph{}
+	Modern server CPUs are a clear example of this. AMD provides bandwidth and frequency information about their professional CPUs in their website. At the moment of writing this, their top CPU for servers was the AMD EPYC 9654\cite{epyc}, launched in November 10, 2022. According to the official data, this is a processor with 96 cores, 192 threads, with a base clock of 2.4 GHz and all-core boost clock of 3.55 GHz; it has a 384 MB L3 Cache and it delivers a per-socket RAM bandwidth of 460.8 GB/s with up to 12 memory channels and 128 PCI-Express 5.0 slots. It is clearly a wonder of modern technology.
 	
-	\paragraph{}However, desktop computers are not that far behind. Likewise, Intel provides the same information for their consumer processors. With 8 performance cores and 16 efficient ones, making a total of 24 cores and 32 threads, with a base frequency of 3.2 GHz and 2.4 GHz and a turbo frequency of 5.6 GHz and 4.4 GHz, respectively, 32 MB L2 Cache plus 36 MB L3 Cache and a maximum RAM bandwidth of 89.6 GB/s, the 14th generation top-of-the-line Core i9 14900K launched recently in October 17, 2023\cite{13900k}, shows impressive hardware as well.
+	\paragraph{}
+	However, desktop computers are not that far behind. Likewise, Intel provides the same information for their consumer processors. With 8 performance cores and 16 efficient ones, making a total of 24 cores and 32 threads, with a base frequency of 3.2 GHz and 2.4 GHz and a turbo frequency of 5.6 GHz and 4.4 GHz, respectively, 32 MB L2 Cache plus 36 MB L3 Cache and a maximum RAM bandwidth of 89.6 GB/s, the 14th generation top-of-the-line Core i9 14900K launched recently in October 17, 2023\cite{13900k}, shows impressive hardware as well.
 	
-	\paragraph{}Even disk, historically considered as the slowest component of a computer (and, hence, the bottleneck), can deliver an astonishing amount of bandwidth in modern days. Just as an example, the Crucial T700, a PCIe Gen 5 NVMe SSD, can sequentially read 11,700 MB/s and write 9,500 MB/s\cite{crucialt700}.
+	\paragraph{}
+	Even disk, historically considered as the slowest component of a computer (and, hence, the bottleneck), can deliver an astonishing amount of bandwidth in modern days. Just as an example, the Crucial T700, a PCIe Gen 5 NVMe SSD, can sequentially read 11,700 MB/s and write 9,500 MB/s\cite{crucialt700}. These are, nonetheless, bandwidth numbers and traditionally the most impacting speed aspect of disk access is latency. However, in modern days, the operating system provides a file cache which mostly solves the disk access latency problem.
 	
-	\paragraph{}Nevertheless, software speeds, in general, could not be more distant.\linebreak
+	\paragraph{}
+	Nevertheless, software speeds, in general, could not be more distant.\linebreak
 	
 	\begin{itemize}
 		\item TODO Talk about the web being paradigm of slow software
 		\item TODO Quote these resources while talking about web slowness:
+		
 		\begin{itemize}
 			\item https://www.forbes.com/sites/kalevleetaru/2016/02/06/why-the-web-is-so-slow-and-what-it-tells-us-about-the-future-of-online-journalism/?sh=125e3ace72f4 
 			\item https://arxiv.org/abs/1603.02293
@@ -40,27 +47,34 @@
 			\item https://2018.perfmattersconf.com/talks/
 			\item https://www.manning.com/books/web-performance-in-action
 		\end{itemize}
+	
 		\item TODO Talk about it not just being the web
 		\item TODO mention the collapse of civilization talk and similar ones \linebreak https://www.youtube.com/watch?v=ZSRHeXYDLko
 		\item TODO Talk about slowness in "high-performance" software. Quote examples (Tensorflow, compilers, windows/macos update times, software installation times windows/macos, Visual Studio (Code), Photoshop)
 	
 	\end{itemize}
 	
-	
 	\subsection{Context and Rationale}
-		\begin{itemize}
-		\item TODO Talk about the importance of compilers and the waste of them being one of the slowest pieces of system software. Quote examples of compilers being slow: Unreal Engine, Linux kernel repository, LLVM, Chrome, etc.
-		
 	
+	\begin{itemize}
+		\item TODO Talk about the importance of compilers and the waste of them being one of the slowest pieces of system software. Quote examples of compilers being slow: Unreal Engine, Linux kernel repository, LLVM, Chrome, etc.	
 	\end{itemize}
-	\paragraph{}Since compilers are so widely used on a daily basis, optimizing them to the point you have some gains in speed, no matter how small it might be, you would improve greatly the experience and productivity of millions developers all over the world as well as a lot of companies and other economic entities' budget.
-	\paragraph{}Due to the limited scope of this essay, both in time and workforce, the cover area must be narrowed down. Given the traditional structure of a compiler, this is divided by a set of stages: lexical analysis (lexer), syntactic analysis (parser), semantic analysis, intermediate representation (with its optional optimization stage) and code generation.
-	\paragraph{}Recently some research has been exploring the possibility to take advantage of the architecture of modern CPUs to speed up lexical and syntactic analysis. Works like the papers published by professor Daniel Lemire and others (TODO quote) have brought SIMD (Single Instruction, Multiple Data) and branchless programming into scene when approaching these traditional compiler stages. The benefits of fully utilizing the underlying hardware pays off: an enormous speed up was obtained with these techniques.
-	\paragraph{}Since lexical analysis receives a given immovable input format and it only loops over source file characters and outputs a list of tokens, I thought it was appropriate to stick with this compiler stage.
-	TODO need to contrast if these numbers are actually correct
-	\paragraph{}Some benchmark was conducted. Given that a Skylake CPU like the one being used in the test (Core i7 6700K) has nearly 40 GB/s of maximum theoretical memory bandwidth (TODO quote). Note that this is an ideal figure given by Intel, but given this data, a figure in the order of GB/s could be considered fast. I wrote a simple lexer (TODO quote) in a scalar manner and some benchmarking utilities. After 3 runs, each one with 256 MiB worth of random lexer input data, the lexer was able to run at approximately 450 MiB/s and spend about 43 ns per token:
+
+	\paragraph{}
+	Since compilers are so widely used on a daily basis, optimizing them to the point you have some gains in speed, no matter how small it might be, you would improve greatly the experience and productivity of millions developers all over the world as well as a lot of companies and other economic entities' budget.
+	\paragraph{}
+	Due to the limited scope of this essay, both in time and workforce, the cover area must be narrowed down. Given the traditional structure of a compiler, this is divided by a set of stages: lexical analysis (lexer), syntactic analysis (parser), semantic analysis, intermediate representation (with its optional optimization stage) and code generation.
+	\paragraph{}
+	Recently some research has been exploring the possibility to take advantage of the architecture of modern CPUs to speed up lexical and syntactic analysis. Works like the papers published by professor Daniel Lemire and others (TODO quote) have brought SIMD (Single Instruction, Multiple Data) and branchless programming into scene when approaching these traditional compiler stages. The benefits of fully utilizing the underlying hardware pays off: an enormous speed up was obtained with these techniques.
+	\paragraph{}
+	Since lexical analysis receives a given immovable input format and it only loops over source file characters and outputs a list of tokens, I thought it was appropriate to stick with this compiler stage. It has no previous dependency other than code, which can be easily autogenerated. Then it makes the most sense to choose this first stage for an initial investigation.
 	
-	\paragraph{}TODO format properly, maybe display an image/table instead
+	\paragraph{}
+	TODO need to contrast if these numbers are actually correct.
+	Some benchmark was conducted. Given that a Skylake CPU like the one being used in the test (Core i7 6700K) has nearly 40 GB/s of maximum theoretical memory bandwidth (TODO quote). Note that this is an ideal figure given by Intel, but given this data, a figure in the order of GB/s could be considered fast. I wrote a simple lexer (TODO quote) in a scalar manner and some benchmarking utilities. After 3 runs, each one with 256 MiB worth of random lexer input data, the lexer was able to run at approximately 450 MiB/s and spend about 43 ns per token:
+	
+	\paragraph{}
+	TODO format properly, maybe display an image/table instead
 \begin{lstlisting}
 ~/dev/lexer| > | zig build run -Doptimize=ReleaseFast -- 0x10000000                                                                                                                      
 Running in ReleaseFast optimization mode. Preparing 0x10000000 bytes (256 MiB) worth of data
@@ -75,11 +89,15 @@ Running in ReleaseFast optimization mode. Preparing 0x10000000 bytes (256 MiB) w
 Data prepared. Running benchmark...
 13334230 tokens, 574440131 ns (445.65 MiB/s, 43.08 ns/token)
 \end{lstlisting}
-	\paragraph{}Therefore one would conclude that there is still a wide margin of improvement which can be work upon.
+	\paragraph{}
+	A simple line counting program, with no manual optimization and using LLVM to optimize the program, which includes auto-vectorization, gets the shocking speed of 13 GiB/s. Therefore one would conclude that there is still a wide margin of improvement which can be work upon.
 
 	\subsection{Goals}
-	\paragraph{}The goal of this work is to explore SIMD and branchless programming, and, in general, taking advantage of the underlying hardware (in particular, Intel Skylake or above processors) for lexical analysis.
+	
+	\paragraph{}
+	The goal of this work is to explore SIMD and branchless programming, and, in general, taking advantage of the underlying hardware (in particular, Intel Skylake or above processors) for lexical analysis.
 	Specific goals are:
+	
 	\begin{itemize}
 		\item Get advantage of hardware facilities to speed up commonly used code.
 		\item Get as close as possible to the bandwidth limit.
@@ -95,7 +113,24 @@ Data prepared. Running benchmark...
 			\item Diversity? How is this related?
 		\end{itemize}
 	\subsection{Used Method and Approach}
-	TODO
+	
+	\paragraph{}
+	Given a program uses branches and the other does branchless programming, there is a need for the benchmark to be completely fair and not use the branch predictor. This means that the source code must not be small and the timing method must not include multiple runs over the same small set of data. Instead, I wrote a random code generator which tries to resemble what real code actually looks like and what lexer normally considers as a valid input. This random generator, however, has some limitations, originated by the restriction on time and scope of this work. I think they are a fair trade-off for an initial investigation work on the matter by an undergraduate student. These are the most noticeable ones:
+	
+	\begin{itemize}
+		\item An space is inserted after an identifier or randomly after a token (50\% of probability).
+		\item Identifiers are formed from a alphabetic starting character followed by alphanumeric ones.
+		\item String and character literals are formed of decimal, alphabetic and operator characters. They do not contain escape characters.
+		\item Integer literals are only decimal, so there are no base prefix, such as the hexadecimal, octal or binary ones.
+		\item The last bytes (less than 512 bytes) of the generated code are covered with a big string literal.
+	\end{itemize}
+
+	\paragraph{}
+	When it comes to the actual exercise of coding a SIMD loop to lexically analyze some input character list, I took the naive approach of lexically analyzing 64 bytes at a time for each loop iteration, but with wrong output: the loop only took into account the first bytes of the input chunk, tokens in multiple chunks were taken into account and these were not stored. Nevertheless, this gave me an idea about the orders of magnitude the speed of a SIMD lexer should be. The test ran at 6-7 GiB/s, which is considerably faster than the scalar prototype.
+	
+	\paragraph{}
+	To fix this incorrectness, for each iteration, I went over all the tokens possible one by one, and with the help of counting trailing zeroes, bitwise not and other logical instructions, incremented the processed character count out of the 64-byte chunk. This, however, led to a proliferation of scalar code inside the loop, being on par with the SIMD one, and generated dependency chains: one must know where the previous token finishes to know where the current one starts. Such event resulted in a massive slowdown, even to the point that by then the scalar code was substantially faster than the vectorized one, which ran at about 336 MiB/s, still without storing the token.
+	
 	\subsection{Planning}
 	When it comes to the code, there are two clear jobs to be done:
 	\begin{itemize}

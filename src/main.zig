@@ -79,7 +79,7 @@ pub fn main() !void {
         _ = try file.readAll(file_buffer);
         break :blk file_buffer;
     } else blk: {
-        const buffer_len = arg_page_size orelse 0x1000000;
+        const buffer_len = arg_page_size orelse 0x10000000;
         print("Preparing 0x{x} bytes ", .{buffer_len});
         if (buffer_len % (1024 * 1024) == 0) {
             print("({} MiB)", .{@divExact(buffer_len, 1024 * 1024)});
@@ -650,7 +650,7 @@ fn generateRandomData(size: usize) !Slice {
             const written_char_count = stream.pos - token_start;
             line_character_count += written_char_count;
 
-            const space = choice == 3 or random.boolean();
+            const space = choice == 2 or random.boolean();
             if (space) {
                 writer.writeByte(' ') catch unreachable;
                 line_character_count += 1;
