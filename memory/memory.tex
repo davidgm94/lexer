@@ -119,8 +119,8 @@ Data prepared. Running benchmark...
 	
 	\begin{itemize}
 		\item An space is inserted after an identifier or randomly after a token (50\% of probability).
-		\item Identifiers are formed from a alphabetic starting character followed by alphanumeric ones.
-		\item String and character literals are formed of decimal, alphabetic and operator characters. They do not contain escape characters.
+		\item Identifiers are formed from a alphabetic starting character followed by alphanumeric ones. Their length is a random number between 1 and 32.
+		\item String and character literals are formed of decimal, alphabetic and operator characters. They do not contain escape characters. The string literal maximum length is a 100 bytes.
 		\item Integer literals are only decimal, so there are no base prefix, such as the hexadecimal, octal or binary ones.
 		\item The last bytes (less than 512 bytes) of the generated code are covered with a big string literal.
 	\end{itemize}
@@ -129,7 +129,10 @@ Data prepared. Running benchmark...
 	When it comes to the actual exercise of coding a SIMD loop to lexically analyze some input character list, I took the naive approach of lexically analyzing 64 bytes at a time for each loop iteration, but with wrong output: the loop only took into account the first bytes of the input chunk, tokens in multiple chunks were taken into account and these were not stored. Nevertheless, this gave me an idea about the orders of magnitude the speed of a SIMD lexer should be. The test ran at 6-7 GiB/s, which is considerably faster than the scalar prototype.
 	
 	\paragraph{}
-	To fix this incorrectness, for each iteration, I went over all the tokens possible one by one, and with the help of counting trailing zeroes, bitwise not and other logical instructions, incremented the processed character count out of the 64-byte chunk. This, however, led to a proliferation of scalar code inside the loop, being on par with the SIMD one, and generated dependency chains: one must know where the previous token finishes to know where the current one starts. Such event resulted in a massive slowdown, even to the point that by then the scalar code was substantially faster than the vectorized one, which ran at about 336 MiB/s, still without storing the token.
+	To fix this incorrectness, for each iteration, I went over all the tokens possible one by one, and with the help of counting trailing zeroes, bitwise not and other logical instructions, incremented the processed character count out of the 64-byte chunk. This, however, led to a proliferation of scalar code inside the loop, being on par with the SIMD one, and generated dependency chains: one must know where the previous token finishes to know where the current one starts. Such event resulted in a massive slowdown, even to the point that by then the scalar code was substantially faster than the vectorized one, which ran at about 336 MiB/s, still without storing the token. This was due to the introduction of scalar code, but also because of not taking advantage of the memory chunk (to refresh the memory of the reader, 64 bytes per iteration). Each iteration we advanced the character counter by the amount of valid token character count processed. This meant that normally, the full SIMD lane(s) was/were not fully utilized and basically the loop was advancing, in the most common way, by the identifier character count plus a space. Unaligned reads of the input data could also be an issue, but the improvement by CPU manufacturers in this regard has led to minor or insignificant overhead. Nevertheless, if I manage to fully utilize the SIMD lane, we will receive the benefit of aligned reads.
+	
+	\paragraph{}
+	I reduced the maximum character count for identifiers and string literals to one character to prove this idea. This made that, at best, a number between 2 and 4 characters were being processed for each iteration, as opposed to the ideal 64 ones. Indeed, this produced an even slower version of the vectorized loop: the bandwidth was about 220 MiB/s, not being as constant as before.
 	
 	\subsection{Planning}
 	When it comes to the code, there are two clear jobs to be done:
