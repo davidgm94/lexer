@@ -541,7 +541,7 @@ fn writeRandomIdentifier(writer: Stream.Writer) void {
     const identifier_start = [2]u8{ random.intRangeAtMost(u8, 'a', 'z'), random.intRangeAtMost(u8, 'A', 'Z') };
     const start_choice = random.boolean();
     writer.writeByte(identifier_start[@intFromBool(start_choice)]) catch unreachable;
-    const identifier_max_character_count = 32;
+    const identifier_max_character_count = 1;
     const this_identifier_character_count = random.intRangeAtMost(u8, 1, identifier_max_character_count);
 
     for (1..this_identifier_character_count) |_| {
@@ -558,7 +558,7 @@ fn writeRandomIdentifier(writer: Stream.Writer) void {
 }
 
 fn writeRandomStringLiteral(writer: Stream.Writer) void {
-    const max_string_len = 100;
+    const max_string_len = 1;
     const len = random.uintLessThan(u8, max_string_len);
 
     writer.writeByte('"') catch unreachable;
