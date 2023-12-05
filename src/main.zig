@@ -68,6 +68,7 @@ pub fn main() !void {
 
     const simd = arg_simd orelse true;
     const lex_self = arg_lex_self orelse false;
+    //
 
     print("Running in {s} optimization mode. SIMD on: {}.\n", .{ @tagName(@import("builtin").mode), simd });
     const lexer_input_data = if (lex_self) blk: {
@@ -282,90 +283,105 @@ fn lexSimd(bytes: Slice, list: *TokenList) u64 {
     const timer = Timer.start();
 
     var character_i: usize = 0;
-    var identifier_carry_mask: u64 = 0;
-    var number_carry_mask: u64 = 0;
-    var character_literal_carry_mask: u64 = 0;
-    var string_literal_carry_mask: u64 = 0;
 
-    while (character_i + chunk_byte_count < bytes.len) {
-        var iteration_offset: usize = 0;
+    var last_character_space: bool = false;
+    var total_token_count: usize = 0;
+
+    while (character_i < bytes.len) {
+        const iteration_offset: usize = 0;
+        _ = iteration_offset;
 
         const chunk = getChunkFromSlice(bytes, character_i);
         // print("chunk:\n```\n{s}\n```\n", .{@as([64]u8, @bitCast(chunk))});
 
         const space_bitset = characterBitset(chunk, '\n') | characterBitset(chunk, '\r') | characterBitset(chunk, '\t') | characterBitset(chunk, ' ');
-        const is_alphabet_bitset = isInsideRanges(chunk, &alphabet_ranges);
-        const is_decimal_bitset = isInsideRange(chunk, decimal_range);
-        const is_underscore_bitset = characterBitset(chunk, '_');
-        const identifier_bitset = is_alphabet_bitset | is_decimal_bitset | is_underscore_bitset;
-        const is_double_quote = characterBitset(chunk, '"');
-        const is_single_quote = characterBitset(chunk, '\'');
-        const is_escape_character = characterBitset(chunk, '\\');
-        _ = is_escape_character;
-        const is_operator_bitset = isInsideRanges(chunk, &operator_ranges);
+        // const space_mask: u64 = @bitCast(space_bitset);
+        var ctz: [chunk_byte_count]u8 = undefined;
+        var not_ctz: [chunk_byte_count]u8 = undefined;
+        var space_masks: [chunk_byte_count]u64 = undefined;
+        var inverse_space_masks: [chunk_byte_count]u64 = undefined;
 
-        const space_mask = ~string_literal_carry_mask | ~character_literal_carry_mask;
+        inline for (0..chunk_byte_count / (8 * 2)) |i| {
+            const shifter_v1 = @Vector(4, u6){i + 16 + 0, i + 16 + 1, i + 16 + 2, i + 16 + 3};
+            const shifter_v2 = @Vector(4, u6){i + 16 + 4, i + 16 + 5, i + 16 + 6, i + 16 + 7};
+            const it_space_mask: u64 = @bitCast(space_bitset);
+            const v1: @Vector(4, u64) = @splat(it_space_mask);
+            const v2 = v1;
+            const v1_inv = ~v1;
+            const v2_inv = v1_inv;
+            const shift_v1 = v1 >> shifter_v1;
+            const shift_v2 = v2 >> shifter_v2;
+            const shift_v1_inv = v1_inv >> shifter_v1;
+            const shift_v2_inv = v2_inv >> shifter_v2;
 
-        const space_character_count = @ctz(~@as(u64, @bitCast(space_bitset))) & space_mask;
-        // print("space character count: {}\n", .{space_character_count});
-        iteration_offset += space_character_count;
-        const space_clobber_mask = b64Mask(space_character_count > 0);
-        identifier_carry_mask &= space_clobber_mask;
-        number_carry_mask &= space_clobber_mask;
-        assert(iteration_offset <= 64);
+            space_masks[i*16 + 0..][0..4].* = @bitCast(shift_v1);
+            space_masks[i*16 + 4..][0..4].* = @bitCast(shift_v2);
 
-        // print("identifier bitset: {}", .{identifier_bitset});
-        const is_identifier_mask = u1Mask(is_alphabet_bitset[iteration_offset]);
-        const identifier_bitset_mask = std.math.shr(u64, @as(u64, @bitCast(identifier_bitset)), iteration_offset);
-        // print("iteration offset: {}. Is identifier mask: 0x{x}. Identifier bitset mask: 0b{b}\n", .{ iteration_offset, is_identifier_mask, identifier_bitset_mask });
-        // print("string literal mask: {x}. char literal mask: {x}\n", .{ string_literal_carry_mask, character_literal_carry_mask });
-        const identifier_character_count = @ctz(~identifier_bitset_mask) & (is_identifier_mask | (identifier_carry_mask | (~string_literal_carry_mask | ~character_literal_carry_mask)));
-        // print("Identifier character count: {}\n", .{identifier_character_count});
-        iteration_offset += identifier_character_count;
-        assert(iteration_offset <= 64);
-        identifier_carry_mask = isEndOfChunkMask(iteration_offset & b64Mask(identifier_character_count != 0));
+            inverse_space_masks[i*16 + 0..][0..4].* = @bitCast(shift_v1_inv);
+            inverse_space_masks[i*16 + 4..][0..4].* = @bitCast(shift_v2_inv);
+        }
+        // inline for (0..chunk_byte_count) |i| {
+        //     const it_space_mask: u64 = @bitCast(space_bitset);
+        //     const it_inverse_space_mask = ~it_space_mask;
+        //     space_masks[i] = it_space_mask >> i;
+        //     inverse_space_masks[i] = it_inverse_space_mask >> i;
+        // }
 
-        const number_literal_character_count = @ctz(~std.math.shr(u64, @as(u64, @bitCast(is_decimal_bitset)), iteration_offset));
-        // print("number ch: {}\n", .{number_literal_character_count});
-        iteration_offset += number_literal_character_count;
-        assert(iteration_offset <= 64);
-        number_carry_mask = isEndOfChunkMask(iteration_offset & b64Mask(number_literal_character_count != 0));
+        inline for (0..chunk_byte_count) |i| {
+            ctz[i] = @ctz(space_masks[i]);
+            not_ctz[i] = @ctz(inverse_space_masks[i]);
+        }
 
-        // const is_end_of_chunk_mask: u64 = iteration_offset &
-        const is_string_literal_start_mask = u1Mask(is_double_quote[iteration_offset]);
-        const supposed_string_literal_character_count = @ctz(~std.math.shr(u64, ~@as(u64, @bitCast(is_double_quote)), iteration_offset + 1));
-        const string_literal_character_count = (@as(u64, 1) + @intFromBool(iteration_offset + supposed_string_literal_character_count + 1 != 64) + supposed_string_literal_character_count) & (is_string_literal_start_mask | string_literal_carry_mask);
-        // print("String literal count: {}. Iteration offset: {}\n", .{ string_literal_character_count, iteration_offset });
-        iteration_offset += string_literal_character_count;
-        assert(iteration_offset <= 64);
-        string_literal_carry_mask = u1Mask(endOfChunkBranchless(iteration_offset) & is_double_quote[63] & b64Mask(string_literal_character_count != 0));
+        var tokens: [64][2]u64 = undefined;
+        var token_count: u8 = 0;
+        var counter: usize = 0;
 
-        const is_operator_bitset_mask = std.math.shr(u64, @as(u64, @bitCast(is_operator_bitset)), iteration_offset);
-        const operator_character_count = @ctz(~is_operator_bitset_mask);
-        iteration_offset += operator_character_count;
-        assert(iteration_offset <= 64);
+        // print("Chunk: {s}\n", .{@as([chunk_byte_count]u8, @bitCast(chunk))});
 
-        // TODO: compute correctly character literal
-        const character_literal_mask = std.math.shr(u64, ~@as(u64, @bitCast(is_single_quote)), iteration_offset + 1);
-        const is_not_end_of_chunk_mask = ~isEndOfChunkMask(iteration_offset);
-        const is_character_literal_start_mask = u1Mask(is_single_quote[iteration_offset & is_not_end_of_chunk_mask]) & is_not_end_of_chunk_mask;
-        // print("Character literal carry mask: {x}", .{character_literal_carry_mask});
-        const character_literal_character_count = (2 + @ctz(~character_literal_mask)) & is_character_literal_start_mask;
-        iteration_offset += character_literal_character_count;
-        // print("Character literal character count: {}\n", .{character_literal_character_count});
-        assert(iteration_offset <= 64);
-        character_literal_carry_mask = u1Mask(endOfChunkBranchless(iteration_offset) & is_single_quote[63] & b64Mask(character_literal_character_count != 0));
+        while (counter < chunk_byte_count) {
+            // print("counter: {}\n", .{counter});
+            const space = ctz[counter & (chunk_byte_count - 1)];
+            const not_space_offset = counter + space;
+            // print("Not space counter {} space: {}", .{ counter, space });
+            const not_space = not_ctz[not_space_offset & (chunk_byte_count - 1)];
+            tokens[token_count] = .{
+                character_i + not_space_offset,
+                character_i + not_space_offset + not_space,
+            };
+            token_count += @intFromBool(not_space > 0) & @intFromBool(~((not_space_offset | counter) & 0xffff_ffff_ffff_ff40) > 0);
+            counter += space + not_space;
 
-        // TODO: extra hardening the code
-        // TODO: store tokens
+            // print("Space: {b}. Not space: {b}\n", .{ space, not_space });
+            // unreachable;
+            // const raw_not_ctz = @ctz(space_mask);
+            // const diff1 = chunk_byte_count - counter;
+            // const min = @min(diff1, raw_not_ctz);
+            // if (min < 64) {
+            //     // print("character i: {} space mask: {b}. NOT ctz: {} diff1: {} min: {}\n", .{ character_i, space_mask, raw_not_ctz, diff1, min });
+            //     const not_ctz: u6 = @intCast(min);
+            //     // print("space mask: {b}. Counter: {}. NOT CTZ: {} ", .{ space_mask, counter, not_ctz });
+            //     const trailing_not_space = not_ctz;
+            //     space_mask >>= trailing_not_space;
+            //     const ctz: u6 = @intCast(@min(chunk_byte_count - (counter + not_ctz), @ctz(~space_mask)));
+            //     // print("CTZ: {}\n", .{ctz});
+            //     const trailing_space = ctz;
+            //     space_mask >>= trailing_space;
+            //     space_counter += trailing_space;
+            //     char_counter += trailing_not_space;
+            //     const count = @as(usize, trailing_space) + trailing_not_space;
+            //     // print("not space: {}. space: {}. count: {}\n", .{ trailing_not_space, trailing_space, count });
+            //     counter += count;
+            // } else break;
+        }
 
-        // print("Space character count: {}. Identifier character count: {}. Number literal character count: {}\n", .{ space_character_count, identifier_character_count, number_literal_character_count });
-        character_i += iteration_offset;
+        total_token_count += token_count;
+
+        last_character_space = @bitCast(space_bitset[chunk_byte_count - 1]);
+        character_i += chunk_byte_count;
     }
 
-    // TODO: loop end
-
     const time_result = timer.end();
+    print("token count {}\n", .{ total_token_count });
 
     return time_result;
 }
@@ -515,11 +531,11 @@ pub fn mmap(size: usize, flags: packed struct {
 }
 
 const writers = [_]Writer{
-    writeRandomOperator,
-    writeRandomInt,
+    //writeRandomOperator,
+    //writeRandomInt,
     writeRandomIdentifier,
-    writeRandomStringLiteral,
-    writeRandomCharacterLiteral,
+    //writeRandomStringLiteral,
+    //writeRandomCharacterLiteral,
 };
 const Slice = []align(page_size) u8;
 
@@ -650,11 +666,8 @@ fn generateRandomData(size: usize) !Slice {
             const written_char_count = stream.pos - token_start;
             line_character_count += written_char_count;
 
-            const space = choice == 2 or random.boolean();
-            if (space) {
-                writer.writeByte(' ') catch unreachable;
-                line_character_count += 1;
-            }
+            writer.writeByte(' ') catch unreachable;
+            line_character_count += 1;
         }
 
         writer.writeByte('\n') catch unreachable;
