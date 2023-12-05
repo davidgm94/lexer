@@ -80,7 +80,10 @@ pub fn main() !void {
         _ = try file.readAll(file_buffer);
         break :blk file_buffer;
     } else blk: {
-        const buffer_len = arg_page_size orelse 0x10000000;
+        const buffer_len = arg_page_size orelse switch (@import("builtin").mode) {
+            .Debug => 0x1000,
+            else => 0x10000000,
+        };
         print("Preparing 0x{x} bytes ", .{buffer_len});
         if (buffer_len % (1024 * 1024) == 0) {
             print("({} MiB)", .{@divExact(buffer_len, 1024 * 1024)});
@@ -298,8 +301,8 @@ fn lexSimd(bytes: Slice, list: *TokenList) u64 {
         // const space_mask: u64 = @bitCast(space_bitset);
         var ctz: [chunk_byte_count]u8 = undefined;
         var not_ctz: [chunk_byte_count]u8 = undefined;
-        var space_masks: [chunk_byte_count]u64 = undefined;
-        var inverse_space_masks: [chunk_byte_count]u64 = undefined;
+        // var space_masks: [chunk_byte_count]u64 = undefined;
+        // var inverse_space_masks: [chunk_byte_count]u64 = undefined;
 
         inline for (0..chunk_byte_count / (8 * 2)) |i| {
             const shifter_v1 = @Vector(4, u6){i + 16 + 0, i + 16 + 1, i + 16 + 2, i + 16 + 3};
@@ -314,11 +317,11 @@ fn lexSimd(bytes: Slice, list: *TokenList) u64 {
             const shift_v1_inv = v1_inv >> shifter_v1;
             const shift_v2_inv = v2_inv >> shifter_v2;
 
-            space_masks[i*16 + 0..][0..4].* = @bitCast(shift_v1);
-            space_masks[i*16 + 4..][0..4].* = @bitCast(shift_v2);
+            ctz[i*16 + 0..][0..4].* = @ctz(shift_v1);
+            ctz[i*16 + 4..][0..4].* = @ctz(shift_v2);
 
-            inverse_space_masks[i*16 + 0..][0..4].* = @bitCast(shift_v1_inv);
-            inverse_space_masks[i*16 + 4..][0..4].* = @bitCast(shift_v2_inv);
+            not_ctz[i*16 + 0..][0..4].* = @ctz(shift_v1_inv);
+            not_ctz[i*16 + 4..][0..4].* = @ctz(shift_v2_inv);
         }
         // inline for (0..chunk_byte_count) |i| {
         //     const it_space_mask: u64 = @bitCast(space_bitset);
@@ -327,29 +330,33 @@ fn lexSimd(bytes: Slice, list: *TokenList) u64 {
         //     inverse_space_masks[i] = it_inverse_space_mask >> i;
         // }
 
-        inline for (0..chunk_byte_count) |i| {
-            ctz[i] = @ctz(space_masks[i]);
-            not_ctz[i] = @ctz(inverse_space_masks[i]);
-        }
+        // inline for (0..chunk_byte_count) |i| {
+        //     ctz[i] = @ctz(space_masks[i]);
+        //     not_ctz[i] = @ctz(inverse_space_masks[i]);
+        // }
 
         var tokens: [64][2]u64 = undefined;
         var token_count: u8 = 0;
         var counter: usize = 0;
 
-        // print("Chunk: {s}\n", .{@as([chunk_byte_count]u8, @bitCast(chunk))});
 
         while (counter < chunk_byte_count) {
             // print("counter: {}\n", .{counter});
             const space = ctz[counter & (chunk_byte_count - 1)];
             const not_space_offset = counter + space;
-            // print("Not space counter {} space: {}", .{ counter, space });
+            const mask = ~((not_space_offset | counter) & 0xffff_ffff_ffff_ff40);
+            print("Chunk: {s}\n", .{@as([chunk_byte_count]u8, @bitCast(chunk))});
+            print("Counter: {} space: {}\n", .{ counter, space });
             const not_space = not_ctz[not_space_offset & (chunk_byte_count - 1)];
+            print("Not space offset: {}. Not space: {}\n", .{not_space_offset, not_space});
             tokens[token_count] = .{
                 character_i + not_space_offset,
                 character_i + not_space_offset + not_space,
             };
-            token_count += @intFromBool(not_space > 0) & @intFromBool(~((not_space_offset | counter) & 0xffff_ffff_ffff_ff40) > 0);
-            counter += space + not_space;
+            token_count += @intFromBool(not_space > 0) & @intFromBool(mask > 0);
+            counter += (@as(usize, space) + not_space) & u1Mask(@intFromBool(mask > 0));
+            print("Counter: {}\n", .{counter});
+            unreachable;
 
             // print("Space: {b}. Not space: {b}\n", .{ space, not_space });
             // unreachable;
